@@ -6,8 +6,7 @@ public class CommonResponse<T> {
     private String message;
     private T data;
 
-    public CommonResponse() {
-    }
+    public CommonResponse() {}
 
     public CommonResponse(boolean success, String message, T data) {
         this.success = success;
@@ -15,16 +14,19 @@ public class CommonResponse<T> {
         this.data = data;
     }
 
-    public static <T> CommonResponse<T> ok(T data) {
-        return new CommonResponse<>(true, "SUCCESS", data);
-    }
-
+    // 성공 응답 (데이터 포함)
     public static <T> CommonResponse<T> ok(String message, T data) {
         return new CommonResponse<>(true, message, data);
     }
 
+    // 실패 응답 (메시지만 전달)
     public static <T> CommonResponse<T> fail(String message) {
         return new CommonResponse<>(false, message, null);
+    }
+
+    // [추가] 실패 응답 (메시지 + 에러 상세 데이터 전달)
+    public static <T> CommonResponse<T> fail(String message, T data) {
+        return new CommonResponse<>(false, message, data);
     }
 
     public boolean isSuccess() {
