@@ -1,51 +1,63 @@
+server:
+  port: 8080
+
 spring:
+  application:
+    name: platform
+
+  # 1. MySQL 영속 데이터베이스 (로컬 포트 3307)
   datasource:
     url: jdbc:mysql://localhost:3307/nexon_platform?useSSL=false&allowPublicKeyRetrieval=true&characterEncoding=UTF-8&serverTimezone=Asia/Seoul
     username: root
     password: root
     driver-class-name: com.mysql.cj.jdbc.Driver
+
+  # 2. JPA & Hibernate DDL
   jpa:
     hibernate:
       ddl-auto: update
+    show-sql: true
     properties:
       hibernate:
         format_sql: true
-        show_sql: true
-    open-in-view: false
+
+  # 3. Redis 인메모리 캐시 & 분산 락
   data:
     redis:
       host: localhost
       port: 6379
+
+  # 4. Kafka 비동기 이벤트 큐 (로컬 연결)
   kafka:
     bootstrap-servers: localhost:9092
-    producer:
-      key-serializer: org.apache.kafka.common.serialization.StringSerializer
-      value-serializer: org.springframework.kafka.support.serializer.JsonSerializer
     consumer:
       group-id: coupon-issue-group
       auto-offset-reset: earliest
       key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
-      value-deserializer: org.springframework.kafka.support.serializer.JsonDeserializer
-      properties:
-        spring.json.trusted.packages: "*"
+      value-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.apache.kafka.common.serialization.StringSerializer
 
+# 5. Prometheus Actuator 지표 노출
 management:
   endpoints:
     web:
       exposure:
-        include: health, info, prometheus, metrics
+        include: prometheus, health, info, metrics
   endpoint:
     prometheus:
       enabled: true
-  metrics:
-    tags:
-      application: nexon-platform-service
 
-server:
-  port: 8080
+# 6. Springdoc Swagger UI
+springdoc:
+  swagger-ui:
+    path: /swagger-ui.html
+    groups-order: DESC
+    operationsSorter: method
 
+# 7. JWT 보안 설정
 jwt:
-  # 256비트(32바이트) 이상의 강력한 비밀키 (HS256)
   secret: nexon-platform-secret-key-for-jwt-token-generation-2026-secure-key-must-be-long!
-  access-token-expiration: 1800000 # 30분 (밀리초)
-  refresh-token-expiration: 604800000 # 7일 (밀리초)
+  access-token-expiration: 1800000
+  refresh-token-expiration: 604800000
