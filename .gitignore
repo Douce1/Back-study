@@ -1,0 +1,39 @@
+Set-Content -Path .\.gitignore -Value @"
+.gradle
+build/
+!gradle/wrapper/gradle-wrapper.jar
+!**/src/main/**/build/
+!**/src/test/**/build/
+
+### STS ###
+.apt_generated
+.classpath
+.factorypath
+.project
+.settings
+.springBeans
+.sts4-cache
+
+### IntelliJ IDEA ###
+.idea
+*.iws
+*.iml
+*.ipr
+out/
+
+### NetBeans ###
+/nbproject/private/
+/nbbuild/
+/dist/
+/nbdist/
+/.nb-gradletaskcache
+
+### VS Code ###
+.vscode/
+
+### OS & Logs ###
+.DS_Store
+Thumbs.db
+*.log
+mysql_data/
+"@ -Encoding UTF8
