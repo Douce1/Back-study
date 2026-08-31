@@ -2,7 +2,6 @@ package com.nexon.platform.service;
 
 import com.nexon.platform.dto.AuthDto;
 import com.nexon.platform.entity.PlatformUser;
-import com.nexon.platform.entity.UserRole;
 import com.nexon.platform.jwt.JwtTokenProvider;
 import com.nexon.platform.repository.UserRepository;
 import org.springframework.security.crypto.password.PasswordEncoder;
@@ -28,9 +27,8 @@ public class AuthService {
             throw new IllegalArgumentException("이미 존재하는 넥슨 계정 태그입니다.");
         }
 
-        // 비밀번호 BCrypt 단방향 해싱 암호화 저장
         String encodedPassword = passwordEncoder.encode(request.getPassword());
-        PlatformUser newUser = new PlatformUser(request.getNexonTag(), encodedPassword, UserRole.ROLE_USER);
+        PlatformUser newUser = new PlatformUser(request.getNexonTag(), encodedPassword, request.getRole());
         PlatformUser savedUser = userRepository.save(newUser);
 
         String accessToken = jwtTokenProvider.createAccessToken(
