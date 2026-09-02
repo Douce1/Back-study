@@ -21,14 +21,21 @@ public class GlobalExceptionHandler {
                 .body(CommonResponse.fail(e.getMessage()));
     }
 
-    // 2. 쿠폰 재고 소진 예외 -> 400 Bad Request
+    // 2. [추가] 1인 1쿠폰 중복 발급 차단 예외 -> 400 Bad Request
+    @ExceptionHandler(DuplicateCouponIssueException.class)
+    public ResponseEntity<CommonResponse<Void>> handleDuplicateCouponIssue(DuplicateCouponIssueException e) {
+        return ResponseEntity.status(HttpStatus.BAD_REQUEST)
+                .body(CommonResponse.fail(e.getMessage()));
+    }
+
+    // 3. 쿠폰 재고 소진 예외 -> 400 Bad Request
     @ExceptionHandler(CouponOutOfStockException.class)
     public ResponseEntity<CommonResponse<Void>> handleCouponOutOfStock(CouponOutOfStockException e) {
         return ResponseEntity.status(HttpStatus.BAD_REQUEST)
                 .body(CommonResponse.fail(e.getMessage()));
     }
 
-    // 3. DTO Validation 실패 -> 400 Bad Request
+    // 4. DTO Validation 실패 -> 400 Bad Request
     @ExceptionHandler(MethodArgumentNotValidException.class)
     public ResponseEntity<CommonResponse<Map<String, String>>> handleValidationExceptions(MethodArgumentNotValidException e) {
         Map<String, String> errors = new HashMap<>();
@@ -39,7 +46,7 @@ public class GlobalExceptionHandler {
                 .body(CommonResponse.fail("입력값 검증에 실패했습니다.", errors));
     }
 
-    // 4. 최상위 예외 (에러 원인을 Swagger에 상세 표기)
+    // 5. 최상위 서버 예외
     @ExceptionHandler(Exception.class)
     public ResponseEntity<CommonResponse<Void>> handleGeneralException(Exception e) {
         e.printStackTrace();
