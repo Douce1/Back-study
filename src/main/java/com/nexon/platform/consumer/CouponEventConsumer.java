@@ -31,6 +31,12 @@ public class CouponEventConsumer {
             CouponIssueEvent event = objectMapper.readValue(messagePayload, CouponIssueEvent.class);
             log.info("[KafkaConsumer] 백그라운드 DB 반영 시작 - couponId: {}, userId: {}", event.getCouponId(), event.getUserId());
 
+            // [테스트 시뮬레이션] 999번 쿠폰 요청 시 인위적인 DB 타임아웃/데드락 장애 유발
+            if (event.getCouponId() == 999L) {
+                log.warn("[⚠️ 모의 장애 발생] 쿠폰 ID가 999이므로 DB Connection Timeout 예외를 강제 발생시킵니다.");
+                throw new RuntimeException("DB Connection Timeout 발생! (Simulated Error)");
+            }
+
             PlatformCoupon coupon = couponRepository.findById(event.getCouponId())
                     .orElseThrow(() -> new IllegalArgumentException("쿠폰 정보를 찾을 수 없습니다."));
 
@@ -38,6 +44,7 @@ public class CouponEventConsumer {
             log.info("[KafkaConsumer] DB 재고 차감 완료 - 남은 수량: {}", coupon.getRemainCount());
         } catch (JsonProcessingException e) {
             log.error("[KafkaConsumer] 메시지 역직렬화 실패: {}", messagePayload, e);
+            throw new RuntimeException("역직렬화 실패", e);
         }
     }
 }
