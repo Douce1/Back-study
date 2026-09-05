@@ -50,4 +50,15 @@ public class CouponController {
         couponService.issueWithKafkaQueue(couponId, userId);
         return CommonResponse.ok("쿠폰 발급 접수 완료 (Kafka 비동기 큐 & 1인 1회 한정)", null);
     }
+
+    @Operation(summary = "Transactional Outbox 기반 쿠폰 발급 (메시지 유실 0% 보장)")
+    @PostMapping("/{couponId}/issue/outbox")
+    public CommonResponse<Void> issueCouponWithOutbox(@PathVariable("couponId") Long couponId,
+                                                      @AuthenticationPrincipal Long userId) {
+        if (userId == null) {
+            throw new IllegalArgumentException("로그인이 필요한 서비스입니다.");
+        }
+        couponService.issueWithOutboxPattern(couponId, userId);
+        return CommonResponse.ok("쿠폰 발급 요청이 Outbox 테이블에 안전하게 접수되었습니다.", null);
+    }
 }
