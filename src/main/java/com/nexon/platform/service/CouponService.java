@@ -1,11 +1,14 @@
 package com.nexon.platform.service;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.nexon.platform.dto.CouponIssueEvent;
 import com.nexon.platform.dto.CouponIssueResponse;
+import com.nexon.platform.entity.OutboxEvent;
 import com.nexon.platform.entity.PlatformCoupon;
 import com.nexon.platform.exception.DuplicateCouponIssueException;
 import com.nexon.platform.producer.CouponEventProducer;
 import com.nexon.platform.repository.CouponRepository;
+import com.nexon.platform.repository.OutboxRepository;
 import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.MeterRegistry;
 import org.redisson.api.RLock;
@@ -27,6 +30,8 @@ public class CouponService {
     private final RedissonClient redissonClient;
     private final StringRedisTemplate redisTemplate;
     private final CouponEventProducer eventProducer;
+    private final OutboxRepository outboxRepository;
+    private final ObjectMapper objectMapper;
 
     // Prometheus 실시간 모니터링 카운터
     private final Counter acceptedCounter;
@@ -37,11 +42,15 @@ public class CouponService {
                          RedissonClient redissonClient,
                          StringRedisTemplate redisTemplate,
                          CouponEventProducer eventProducer,
-                         MeterRegistry meterRegistry) {
+                         MeterRegistry meterRegistry,
+                         OutboxRepository outboxRepository,
+                         ObjectMapper objectMapper) {
         this.couponRepository = couponRepository;
         this.redissonClient = redissonClient;
         this.redisTemplate = redisTemplate;
         this.eventProducer = eventProducer;
+        this.outboxRepository = outboxRepository;
+        this.objectMapper = objectMapper;
 
         // Prometheus 커스텀 메트릭 등록
         this.acceptedCounter = Counter.builder("coupon_issue_accepted_total")
@@ -121,6 +130,46 @@ public class CouponService {
             redisTemplate.opsForValue().increment(stockKey);
             redisTemplate.opsForSet().remove(issuedKey, String.valueOf(userId));
             throw new RuntimeException("Kafka 큐 전송 실패로 인한 롤백", e);
+        }
+    }
+
+    // Transactional Outbox 기반 발급 메서드
+    @Transactional
+    public void issueWithOutboxPattern(Long couponId, Long userId) {
+        String issuedKey = "coupon:issued:" + couponId;
+        String stockKey = "coupon:stock:" + couponId;
+
+        // 1. Redis Set 중복 검증
+        Long isFirst = redisTemplate.opsForSet().add(issuedKey, String.valueOf(userId));
+        if (isFirst == null || isFirst == 0L) {
+            duplicateCounter.increment();
+            throw new DuplicateCouponIssueException("이미 발급받은 쿠폰입니다. (1인 1회 한정)");
+        }
+
+        // 2. Redis 원자적 재고 선점
+        Long remainStock = redisTemplate.opsForValue().decrement(stockKey);
+        if (remainStock != null && remainStock < 0) {
+            redisTemplate.opsForValue().increment(stockKey);
+            redisTemplate.opsForSet().remove(issuedKey, String.valueOf(userId));
+            soldoutCounter.increment();
+            throw new IllegalArgumentException("쿠폰 재고가 모두 소진되었습니다.");
+        }
+
+        // 3. Kafka로 직접 쏘지 않고, DB outbox_event 테이블에 PENDING 상태로 저장 (로컬 트랜잭션 보장)
+        try {
+            CouponIssueEvent event = new CouponIssueEvent(couponId, userId);
+            String payload = objectMapper.writeValueAsString(event);
+
+            OutboxEvent outboxEvent = new OutboxEvent("COUPON", couponId, "COUPON_ISSUED", payload);
+            outboxRepository.save(outboxEvent);
+
+            acceptedCounter.increment();
+            log.info("[Outbox 적재 완료] 유저 {}의 쿠폰 {} 발급 이벤트가 DB Outbox에 PENDING으로 저장되었습니다.", userId, couponId);
+        } catch (Exception e) {
+            // DB 저장 실패 시 Redis 선점 롤백
+            redisTemplate.opsForValue().increment(stockKey);
+            redisTemplate.opsForSet().remove(issuedKey, String.valueOf(userId));
+            throw new RuntimeException("Outbox 이벤트 영속화 실패로 인한 Redis 롤백", e);
         }
     }
 }
