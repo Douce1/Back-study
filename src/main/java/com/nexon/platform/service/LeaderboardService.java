@@ -4,10 +4,14 @@ import com.nexon.platform.dto.LeaderboardEntry;
 import com.nexon.platform.dto.UserRankResponse;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.dao.DataAccessException;
+import org.springframework.data.redis.connection.RedisConnection;
+import org.springframework.data.redis.core.RedisCallback;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.data.redis.core.ZSetOperations;
 import org.springframework.stereotype.Service;
 
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Set;
@@ -18,7 +22,6 @@ public class LeaderboardService {
     private static final Logger log = LoggerFactory.getLogger(LeaderboardService.class);
     private static final String LEADERBOARD_KEY = "leaderboard:season:1";
 
-    // 약 2033년 시점 기준 에포크 밀리초 (타임스탬프 역산 상한치)
     private static final double MAX_TIMESTAMP_MS = 2_000_000_000_000.0;
     private static final double SCALE_FACTOR = 10_000_000_000_000.0;
 
@@ -28,26 +31,22 @@ public class LeaderboardService {
         this.redisTemplate = redisTemplate;
     }
 
-    // 선착순 보정 복합 점수(Composite Score) 산출
     private double calculateCompositeScore(Double baseScore) {
         long currentMillis = System.currentTimeMillis();
         double tieBreaker = (MAX_TIMESTAMP_MS - currentMillis) / SCALE_FACTOR;
         return Math.floor(baseScore) + tieBreaker;
     }
 
-    // 소수점 보정값을 제거한 원본 게임 점수 복원
     private double extractBaseScore(Double compositeScore) {
         return Math.floor(compositeScore);
     }
 
-    // 점수 등록 및 실시간 선착순 랭킹 반영 (O(log N))
     public void submitScore(Long userId, Double score) {
         double compositeScore = calculateCompositeScore(score);
         redisTemplate.opsForZSet().add(LEADERBOARD_KEY, String.valueOf(userId), compositeScore);
         log.info("[리더보드 점수 갱신] 유저 {}: 원본점수={}점 (복합점수={})", userId, score, compositeScore);
     }
 
-    // 상위 N위 랭커 목록 조회 (O(log N + M))
     public List<LeaderboardEntry> getTopRankers(int limit) {
         Set<ZSetOperations.TypedTuple<String>> rankTuples =
                 redisTemplate.opsForZSet().reverseRangeWithScores(LEADERBOARD_KEY, 0, limit - 1);
@@ -67,15 +66,43 @@ public class LeaderboardService {
         return result;
     }
 
-    // 내 실시간 순위 및 순수 점수 조회 (O(log N))
+    // 내 실시간 순위, 점수 및 O(1) 상위 백분위 계산
     public UserRankResponse getUserRank(Long userId) {
         Long rankIndex = redisTemplate.opsForZSet().reverseRank(LEADERBOARD_KEY, String.valueOf(userId));
         Double compositeScore = redisTemplate.opsForZSet().score(LEADERBOARD_KEY, String.valueOf(userId));
+        Long totalPlayers = redisTemplate.opsForZSet().size(LEADERBOARD_KEY); // ZCARD: O(1)
 
         if (rankIndex == null || compositeScore == null) {
             throw new IllegalArgumentException("리더보드에 등록되지 않은 유저입니다.");
         }
 
-        return new UserRankResponse(userId, rankIndex.intValue() + 1, extractBaseScore(compositeScore));
+        int rank = rankIndex.intValue() + 1;
+        long total = (totalPlayers != null && totalPlayers > 0) ? totalPlayers : 1L;
+
+        // 상위 백분위 계산 (소수점 둘째 자리까지 반올림: (rank / total) * 100)
+        double rawPercentile = ((double) rank / total) * 100.0;
+        double roundedPercentile = Math.round(rawPercentile * 100.0) / 100.0;
+
+        return new UserRankResponse(userId, rank, extractBaseScore(compositeScore), roundedPercentile, total);
     }
+
+    // Redis 파이프라이닝(Pipelining)을 통한 대규모 더미 점수 일괄 고속 적재
+    public void bulkRegisterScores(List<ScoreData> scores) {
+        byte[] keyBytes = LEADERBOARD_KEY.getBytes(StandardCharsets.UTF_8);
+
+        redisTemplate.executePipelined(new RedisCallback<Object>() {
+            @Override
+            public Object doInRedis(RedisConnection connection) throws DataAccessException {
+                for (ScoreData data : scores) {
+                    byte[] memberBytes = String.valueOf(data.userId()).getBytes(StandardCharsets.UTF_8);
+                    double compositeScore = calculateCompositeScore(data.score());
+                    connection.zSetCommands().zAdd(keyBytes, compositeScore, memberBytes);
+                }
+                return null;
+            }
+        });
+        log.info("[Redis 파이프라인] 더미 유저 {}명의 점수가 초고속 일괄 적재되었습니다.", scores.size());
+    }
+
+    public record ScoreData(Long userId, Double score) {}
 }
