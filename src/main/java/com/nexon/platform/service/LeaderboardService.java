@@ -1,7 +1,10 @@
 package com.nexon.platform.service;
 
 import com.nexon.platform.dto.LeaderboardEntry;
+import com.nexon.platform.dto.SeasonArchiveResponse;
 import com.nexon.platform.dto.UserRankResponse;
+import com.nexon.platform.entity.SeasonLeaderboardSnapshot;
+import com.nexon.platform.repository.SeasonLeaderboardSnapshotRepository;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.dao.DataAccessException;
@@ -10,6 +13,7 @@ import org.springframework.data.redis.core.RedisCallback;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.data.redis.core.ZSetOperations;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
 
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
@@ -20,15 +24,19 @@ import java.util.Set;
 public class LeaderboardService {
 
     private static final Logger log = LoggerFactory.getLogger(LeaderboardService.class);
-    private static final String LEADERBOARD_KEY = "leaderboard:season:1";
+    private static final String LEADERBOARD_KEY_PREFIX = "leaderboard:season:";
+    private static final String DEFAULT_LEADERBOARD_KEY = "leaderboard:season:1";
 
     private static final double MAX_TIMESTAMP_MS = 2_000_000_000_000.0;
     private static final double SCALE_FACTOR = 10_000_000_000_000.0;
 
     private final StringRedisTemplate redisTemplate;
+    private final SeasonLeaderboardSnapshotRepository snapshotRepository;
 
-    public LeaderboardService(StringRedisTemplate redisTemplate) {
+    public LeaderboardService(StringRedisTemplate redisTemplate,
+                              SeasonLeaderboardSnapshotRepository snapshotRepository) {
         this.redisTemplate = redisTemplate;
+        this.snapshotRepository = snapshotRepository;
     }
 
     private double calculateCompositeScore(Double baseScore) {
@@ -43,13 +51,13 @@ public class LeaderboardService {
 
     public void submitScore(Long userId, Double score) {
         double compositeScore = calculateCompositeScore(score);
-        redisTemplate.opsForZSet().add(LEADERBOARD_KEY, String.valueOf(userId), compositeScore);
+        redisTemplate.opsForZSet().add(DEFAULT_LEADERBOARD_KEY, String.valueOf(userId), compositeScore);
         log.info("[리더보드 점수 갱신] 유저 {}: 원본점수={}점 (복합점수={})", userId, score, compositeScore);
     }
 
     public List<LeaderboardEntry> getTopRankers(int limit) {
         Set<ZSetOperations.TypedTuple<String>> rankTuples =
-                redisTemplate.opsForZSet().reverseRangeWithScores(LEADERBOARD_KEY, 0, limit - 1);
+                redisTemplate.opsForZSet().reverseRangeWithScores(DEFAULT_LEADERBOARD_KEY, 0, limit - 1);
 
         List<LeaderboardEntry> result = new ArrayList<>();
         if (rankTuples == null || rankTuples.isEmpty()) {
@@ -66,11 +74,10 @@ public class LeaderboardService {
         return result;
     }
 
-    // 내 실시간 순위, 점수 및 O(1) 상위 백분위 계산
     public UserRankResponse getUserRank(Long userId) {
-        Long rankIndex = redisTemplate.opsForZSet().reverseRank(LEADERBOARD_KEY, String.valueOf(userId));
-        Double compositeScore = redisTemplate.opsForZSet().score(LEADERBOARD_KEY, String.valueOf(userId));
-        Long totalPlayers = redisTemplate.opsForZSet().size(LEADERBOARD_KEY); // ZCARD: O(1)
+        Long rankIndex = redisTemplate.opsForZSet().reverseRank(DEFAULT_LEADERBOARD_KEY, String.valueOf(userId));
+        Double compositeScore = redisTemplate.opsForZSet().score(DEFAULT_LEADERBOARD_KEY, String.valueOf(userId));
+        Long totalPlayers = redisTemplate.opsForZSet().size(DEFAULT_LEADERBOARD_KEY);
 
         if (rankIndex == null || compositeScore == null) {
             throw new IllegalArgumentException("리더보드에 등록되지 않은 유저입니다.");
@@ -79,16 +86,14 @@ public class LeaderboardService {
         int rank = rankIndex.intValue() + 1;
         long total = (totalPlayers != null && totalPlayers > 0) ? totalPlayers : 1L;
 
-        // 상위 백분위 계산 (소수점 둘째 자리까지 반올림: (rank / total) * 100)
         double rawPercentile = ((double) rank / total) * 100.0;
         double roundedPercentile = Math.round(rawPercentile * 100.0) / 100.0;
 
         return new UserRankResponse(userId, rank, extractBaseScore(compositeScore), roundedPercentile, total);
     }
 
-    // Redis 파이프라이닝(Pipelining)을 통한 대규모 더미 점수 일괄 고속 적재
     public void bulkRegisterScores(List<ScoreData> scores) {
-        byte[] keyBytes = LEADERBOARD_KEY.getBytes(StandardCharsets.UTF_8);
+        byte[] keyBytes = DEFAULT_LEADERBOARD_KEY.getBytes(StandardCharsets.UTF_8);
 
         redisTemplate.executePipelined(new RedisCallback<Object>() {
             @Override
@@ -102,6 +107,50 @@ public class LeaderboardService {
             }
         });
         log.info("[Redis 파이프라인] 더미 유저 {}명의 점수가 초고속 일괄 적재되었습니다.", scores.size());
+    }
+
+    // 시즌 종료 처리: Redis ZSET 데이터를 RDBMS로 일괄 스냅샷 영속화 후 Redis 키 리셋
+    @Transactional
+    public SeasonArchiveResponse archiveSeason(int seasonId) {
+        String seasonKey = LEADERBOARD_KEY_PREFIX + seasonId;
+        Long total = redisTemplate.opsForZSet().size(seasonKey);
+
+        if (total == null || total == 0) {
+            throw new IllegalStateException("시즌 " + seasonId + "에 아카이빙할 랭킹 데이터가 존재하지 않습니다.");
+        }
+
+        // 전체 랭킹을 1등부터 순서대로 추출 (O(N))
+        Set<ZSetOperations.TypedTuple<String>> tuples =
+                redisTemplate.opsForZSet().reverseRangeWithScores(seasonKey, 0, -1);
+
+        if (tuples == null || tuples.isEmpty()) {
+            throw new IllegalStateException("시즌 랭킹 데이터 추출 실패");
+        }
+
+        List<SeasonLeaderboardSnapshot> snapshots = new ArrayList<>();
+        int rank = 1;
+        Long topUserId = null;
+        Double topScore = null;
+
+        for (ZSetOperations.TypedTuple<String> tuple : tuples) {
+            Long userId = Long.valueOf(tuple.getValue());
+            Double baseScore = extractBaseScore(tuple.getScore());
+
+            if (rank == 1) {
+                topUserId = userId;
+                topScore = baseScore;
+            }
+            snapshots.add(new SeasonLeaderboardSnapshot(seasonId, userId, rank++, baseScore));
+        }
+
+        // MySQL RDBMS에 일괄 영속화 (JPA saveAll)
+        snapshotRepository.saveAll(snapshots);
+
+        // RDBMS 영속화 성공 확인 후 Redis 시즌 키 제거 (다음 시즌을 위한 초기화)
+        redisTemplate.delete(seasonKey);
+
+        log.info("[시즌 아카이빙 완료] 시즌 {}: 총 {}명 RDBMS 영속화 및 Redis 시즌 키 삭제 완료", seasonId, snapshots.size());
+        return new SeasonArchiveResponse(seasonId, snapshots.size(), topUserId, topScore);
     }
 
     public record ScoreData(Long userId, Double score) {}
