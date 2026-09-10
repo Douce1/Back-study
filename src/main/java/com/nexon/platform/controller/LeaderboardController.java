@@ -1,7 +1,9 @@
 package com.nexon.platform.controller;
 
 import com.nexon.platform.dto.CommonResponse;
+import com.nexon.platform.dto.HallOfFameEntry;
 import com.nexon.platform.dto.LeaderboardEntry;
+import com.nexon.platform.dto.PageResponse;
 import com.nexon.platform.dto.ScoreSubmitRequest;
 import com.nexon.platform.dto.SeasonArchiveResponse;
 import com.nexon.platform.dto.UserRankResponse;
@@ -75,5 +77,15 @@ public class LeaderboardController {
     public CommonResponse<SeasonArchiveResponse> archiveSeason(@PathVariable int seasonId) {
         SeasonArchiveResponse response = leaderboardService.archiveSeason(seasonId);
         return CommonResponse.ok("시즌 " + seasonId + " 랭킹이 RDBMS로 성공적으로 아카이빙되고 시즌이 초기화되었습니다.", response);
+    }
+
+    @Operation(summary = "과거 시즌 명예의 전당 페이징 조회 (RDBMS 아카이브)")
+    @GetMapping("/season/{seasonId}/hall-of-fame")
+    public CommonResponse<PageResponse<HallOfFameEntry>> getHallOfFame(
+            @PathVariable int seasonId,
+            @RequestParam(defaultValue = "0") int page,
+            @RequestParam(defaultValue = "10") int size) {
+        PageResponse<HallOfFameEntry> response = leaderboardService.getHallOfFame(seasonId, page, size);
+        return CommonResponse.ok("시즌 " + seasonId + " 명예의 전당 " + (page + 1) + "페이지 조회 완료", response);
     }
 }

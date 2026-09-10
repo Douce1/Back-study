@@ -1,6 +1,8 @@
 package com.nexon.platform.service;
 
+import com.nexon.platform.dto.HallOfFameEntry;
 import com.nexon.platform.dto.LeaderboardEntry;
+import com.nexon.platform.dto.PageResponse;
 import com.nexon.platform.dto.SeasonArchiveResponse;
 import com.nexon.platform.dto.UserRankResponse;
 import com.nexon.platform.entity.SeasonLeaderboardSnapshot;
@@ -8,6 +10,9 @@ import com.nexon.platform.repository.SeasonLeaderboardSnapshotRepository;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.dao.DataAccessException;
+import org.springframework.data.domain.Page;
+import org.springframework.data.domain.PageRequest;
+import org.springframework.data.domain.Pageable;
 import org.springframework.data.redis.connection.RedisConnection;
 import org.springframework.data.redis.core.RedisCallback;
 import org.springframework.data.redis.core.StringRedisTemplate;
@@ -109,7 +114,6 @@ public class LeaderboardService {
         log.info("[Redis 파이프라인] 더미 유저 {}명의 점수가 초고속 일괄 적재되었습니다.", scores.size());
     }
 
-    // 시즌 종료 처리: Redis ZSET 데이터를 RDBMS로 일괄 스냅샷 영속화 후 Redis 키 리셋
     @Transactional
     public SeasonArchiveResponse archiveSeason(int seasonId) {
         String seasonKey = LEADERBOARD_KEY_PREFIX + seasonId;
@@ -119,7 +123,6 @@ public class LeaderboardService {
             throw new IllegalStateException("시즌 " + seasonId + "에 아카이빙할 랭킹 데이터가 존재하지 않습니다.");
         }
 
-        // 전체 랭킹을 1등부터 순서대로 추출 (O(N))
         Set<ZSetOperations.TypedTuple<String>> tuples =
                 redisTemplate.opsForZSet().reverseRangeWithScores(seasonKey, 0, -1);
 
@@ -143,14 +146,33 @@ public class LeaderboardService {
             snapshots.add(new SeasonLeaderboardSnapshot(seasonId, userId, rank++, baseScore));
         }
 
-        // MySQL RDBMS에 일괄 영속화 (JPA saveAll)
         snapshotRepository.saveAll(snapshots);
-
-        // RDBMS 영속화 성공 확인 후 Redis 시즌 키 제거 (다음 시즌을 위한 초기화)
         redisTemplate.delete(seasonKey);
 
         log.info("[시즌 아카이빙 완료] 시즌 {}: 총 {}명 RDBMS 영속화 및 Redis 시즌 키 삭제 완료", seasonId, snapshots.size());
         return new SeasonArchiveResponse(seasonId, snapshots.size(), topUserId, topScore);
+    }
+
+    // 과거 시즌 명예의 전당 페이징 조회 (RDBMS 복합 인덱스 활용)
+    @Transactional(readOnly = true)
+    public PageResponse<HallOfFameEntry> getHallOfFame(int seasonId, int page, int size) {
+        int validatedSize = Math.min(Math.max(size, 1), 100);
+        int validatedPage = Math.max(page, 0);
+
+        Pageable pageable = PageRequest.of(validatedPage, validatedSize);
+        Page<SeasonLeaderboardSnapshot> snapshotPage =
+                snapshotRepository.findBySeasonIdOrderByFinalRankAsc(seasonId, pageable);
+
+        Page<HallOfFameEntry> entryPage = snapshotPage.map(snapshot ->
+                new HallOfFameEntry(
+                        snapshot.getFinalRank(),
+                        snapshot.getUserId(),
+                        snapshot.getFinalScore(),
+                        snapshot.getArchivedAt()
+                )
+        );
+
+        return PageResponse.from(entryPage);
     }
 
     public record ScoreData(Long userId, Double score) {}
