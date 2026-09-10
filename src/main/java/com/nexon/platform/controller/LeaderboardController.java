@@ -3,6 +3,7 @@ package com.nexon.platform.controller;
 import com.nexon.platform.dto.CommonResponse;
 import com.nexon.platform.dto.LeaderboardEntry;
 import com.nexon.platform.dto.ScoreSubmitRequest;
+import com.nexon.platform.dto.SeasonArchiveResponse;
 import com.nexon.platform.dto.UserRankResponse;
 import com.nexon.platform.service.LeaderboardService;
 import io.swagger.v3.oas.annotations.Operation;
@@ -61,12 +62,18 @@ public class LeaderboardController {
     public CommonResponse<String> populateDummyScores(
             @RequestParam(defaultValue = "1000") int count) {
         List<LeaderboardService.ScoreData> dummyList = new ArrayList<>(count);
-        // 1,000명의 더미 유저에게 1,000점부터 10,000점까지 균등 분배
         for (long i = 100; i < 100 + count; i++) {
-            double score = 1000.0 + ((i - 100) * 9.0); // 1000.0 ~ 9991.0점
+            double score = 1000.0 + ((i - 100) * 9.0);
             dummyList.add(new LeaderboardService.ScoreData(i, score));
         }
         leaderboardService.bulkRegisterScores(dummyList);
         return CommonResponse.ok(count + "명의 더미 경쟁자 데이터가 Redis 파이프라이닝으로 초고속 적재되었습니다.", null);
+    }
+
+    @Operation(summary = "시즌 종료 정산 및 RDBMS 스냅샷 영속화 (Redis -> MySQL 아카이빙 & 시즌 리셋)")
+    @PostMapping("/season/{seasonId}/archive")
+    public CommonResponse<SeasonArchiveResponse> archiveSeason(@PathVariable int seasonId) {
+        SeasonArchiveResponse response = leaderboardService.archiveSeason(seasonId);
+        return CommonResponse.ok("시즌 " + seasonId + " 랭킹이 RDBMS로 성공적으로 아카이빙되고 시즌이 초기화되었습니다.", response);
     }
 }
