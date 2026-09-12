@@ -38,6 +38,9 @@ dependencies {
     runtimeOnly 'io.jsonwebtoken:jjwt-impl:0.12.5'
     runtimeOnly 'io.jsonwebtoken:jjwt-jackson:0.12.5'
 
+    // [Day 27] 고성능 JVM 로컬 인메모리 캐시 (Caffeine)
+    implementation 'com.github.ben-manes.caffeine:caffeine'
+
     runtimeOnly 'com.mysql:mysql-connector-j'
     implementation 'org.redisson:redisson:3.31.0'
 

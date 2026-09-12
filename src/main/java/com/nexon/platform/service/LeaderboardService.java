@@ -1,5 +1,9 @@
 package com.nexon.platform.service;
 
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.github.benmanes.caffeine.cache.Cache;
+import com.github.benmanes.caffeine.cache.Caffeine;
 import com.nexon.platform.dto.HallOfFameEntry;
 import com.nexon.platform.dto.LeaderboardEntry;
 import com.nexon.platform.dto.PageResponse;
@@ -24,6 +28,7 @@ import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Set;
+import java.util.concurrent.TimeUnit;
 
 @Service
 public class LeaderboardService {
@@ -37,11 +42,21 @@ public class LeaderboardService {
 
     private final StringRedisTemplate redisTemplate;
     private final SeasonLeaderboardSnapshotRepository snapshotRepository;
+    private final ObjectMapper objectMapper;
+
+    // L1 로컬 캐시 (Caffeine: 최대 500개 페이지, 10분 만료)
+    private final Cache<String, PageResponse<HallOfFameEntry>> localCache;
 
     public LeaderboardService(StringRedisTemplate redisTemplate,
-                              SeasonLeaderboardSnapshotRepository snapshotRepository) {
+                              SeasonLeaderboardSnapshotRepository snapshotRepository,
+                              ObjectMapper objectMapper) {
         this.redisTemplate = redisTemplate;
         this.snapshotRepository = snapshotRepository;
+        this.objectMapper = objectMapper;
+        this.localCache = Caffeine.newBuilder()
+                .maximumSize(500)
+                .expireAfterWrite(10, TimeUnit.MINUTES)
+                .build();
     }
 
     private double calculateCompositeScore(Double baseScore) {
@@ -153,12 +168,41 @@ public class LeaderboardService {
         return new SeasonArchiveResponse(seasonId, snapshots.size(), topUserId, topScore);
     }
 
-    // 과거 시즌 명예의 전당 페이징 조회 (RDBMS 복합 인덱스 활용)
+    // [Day 27] 과거 시즌 명예의 전당 멀티티어 캐시 조회 (L1 Caffeine -> L2 Redis -> DB)
     @Transactional(readOnly = true)
     public PageResponse<HallOfFameEntry> getHallOfFame(int seasonId, int page, int size) {
         int validatedSize = Math.min(Math.max(size, 1), 100);
         int validatedPage = Math.max(page, 0);
 
+        String localCacheKey = String.format("hof:season:%d:page:%d:size:%d", seasonId, validatedPage, validatedSize);
+        String redisCacheKey = "cache:" + localCacheKey;
+
+        // 1. L1 로컬 캐시 (Caffeine) 확인 (0ms 참조)
+        PageResponse<HallOfFameEntry> l1Cached = localCache.getIfPresent(localCacheKey);
+        if (l1Cached != null) {
+            log.info("[L1 로컬 캐시 적중 (Caffeine)] {}", localCacheKey);
+            return l1Cached;
+        }
+
+        // 2. L2 분산 캐시 (Redis) 확인 (~1ms 참조)
+        try {
+            String l2CachedJson = redisTemplate.opsForValue().get(redisCacheKey);
+            if (l2CachedJson != null) {
+                log.info("[L2 분산 캐시 적중 (Redis)] {}", localCacheKey);
+                PageResponse<HallOfFameEntry> l2Cached = objectMapper.readValue(
+                        l2CachedJson,
+                        new TypeReference<PageResponse<HallOfFameEntry>>() {}
+                );
+                // L1 로컬 캐시 동기화 (워밍)
+                localCache.put(localCacheKey, l2Cached);
+                return l2Cached;
+            }
+        } catch (Exception e) {
+            log.warn("[L2 캐시 조회 실패 - DB 폴백 진행] error={}", e.getMessage());
+        }
+
+        // 3. 캐시 미스 -> RDBMS (MySQL) 인덱스 조회 (~10ms)
+        log.info("[캐시 미스 -> RDBMS 조회 및 캐시 워밍] {}", localCacheKey);
         Pageable pageable = PageRequest.of(validatedPage, validatedSize);
         Page<SeasonLeaderboardSnapshot> snapshotPage =
                 snapshotRepository.findBySeasonIdOrderByFinalRankAsc(seasonId, pageable);
@@ -172,7 +216,22 @@ public class LeaderboardService {
                 )
         );
 
-        return PageResponse.from(entryPage);
+        PageResponse<HallOfFameEntry> response = PageResponse.from(entryPage);
+
+        // 4. L1(Caffeine) 및 L2(Redis, TTL 1시간) 동시 적재
+        localCache.put(localCacheKey, response);
+        try {
+            String json = objectMapper.writeValueAsString(response);
+            redisTemplate.opsForValue().set(redisCacheKey, json, 1, TimeUnit.HOURS);
+        } catch (Exception e) {
+            log.warn("[L2 캐시 적재 실패] error={}", e.getMessage());
+        }
+
+        return response;
+    }
+
+    public void clearLocalCache() {
+        localCache.invalidateAll();
     }
 
     public record ScoreData(Long userId, Double score) {}
