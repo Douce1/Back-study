@@ -11,6 +11,8 @@ import com.nexon.platform.dto.SeasonArchiveResponse;
 import com.nexon.platform.dto.UserRankResponse;
 import com.nexon.platform.entity.SeasonLeaderboardSnapshot;
 import com.nexon.platform.repository.SeasonLeaderboardSnapshotRepository;
+import org.redisson.api.RLock;
+import org.redisson.api.RedissonClient;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.dao.DataAccessException;
@@ -43,16 +45,19 @@ public class LeaderboardService {
     private final StringRedisTemplate redisTemplate;
     private final SeasonLeaderboardSnapshotRepository snapshotRepository;
     private final ObjectMapper objectMapper;
+    private final RedissonClient redissonClient;
 
     // L1 로컬 캐시 (Caffeine: 최대 500개 페이지, 10분 만료)
     private final Cache<String, PageResponse<HallOfFameEntry>> localCache;
 
     public LeaderboardService(StringRedisTemplate redisTemplate,
                               SeasonLeaderboardSnapshotRepository snapshotRepository,
-                              ObjectMapper objectMapper) {
+                              ObjectMapper objectMapper,
+                              RedissonClient redissonClient) {
         this.redisTemplate = redisTemplate;
         this.snapshotRepository = snapshotRepository;
         this.objectMapper = objectMapper;
+        this.redissonClient = redissonClient;
         this.localCache = Caffeine.newBuilder()
                 .maximumSize(500)
                 .expireAfterWrite(10, TimeUnit.MINUTES)
@@ -168,7 +173,7 @@ public class LeaderboardService {
         return new SeasonArchiveResponse(seasonId, snapshots.size(), topUserId, topScore);
     }
 
-    // [Day 27] 과거 시즌 명예의 전당 멀티티어 캐시 조회 (L1 Caffeine -> L2 Redis -> DB)
+    // [Day 28] Redisson 분산 락(Mutex) 기반 캐시 스탬피드 방어 및 Double-Checked Locking 적용
     @Transactional(readOnly = true)
     public PageResponse<HallOfFameEntry> getHallOfFame(int seasonId, int page, int size) {
         int validatedSize = Math.min(Math.max(size, 1), 100);
@@ -176,15 +181,87 @@ public class LeaderboardService {
 
         String localCacheKey = String.format("hof:season:%d:page:%d:size:%d", seasonId, validatedPage, validatedSize);
         String redisCacheKey = "cache:" + localCacheKey;
+        String lockKey = "lock:" + localCacheKey;
 
-        // 1. L1 로컬 캐시 (Caffeine) 확인 (0ms 참조)
+        // 1. L1 로컬 캐시 (Caffeine) 확인 (0ms)
         PageResponse<HallOfFameEntry> l1Cached = localCache.getIfPresent(localCacheKey);
         if (l1Cached != null) {
             log.info("[L1 로컬 캐시 적중 (Caffeine)] {}", localCacheKey);
             return l1Cached;
         }
 
-        // 2. L2 분산 캐시 (Redis) 확인 (~1ms 참조)
+        // 2. L2 분산 캐시 (Redis) 확인 (~1ms)
+        PageResponse<HallOfFameEntry> l2Cached = getFromRedis(redisCacheKey, localCacheKey);
+        if (l2Cached != null) {
+            return l2Cached;
+        }
+
+        // 3. 캐시 미스 -> Redisson 분산 락(Mutex) 획득 시도 (동시 요청 중 단 1개만 DB 접근 허용)
+        RLock lock = redissonClient.getLock(lockKey);
+        try {
+            // 최대 3초 대기, 5초 후 자동 해제
+            boolean isLocked = lock.tryLock(3, 5, TimeUnit.SECONDS);
+            if (!isLocked) {
+                log.warn("[락 획득 타임아웃] {}", lockKey);
+                PageResponse<HallOfFameEntry> retryL1 = localCache.getIfPresent(localCacheKey);
+                if (retryL1 != null) return retryL1;
+                PageResponse<HallOfFameEntry> retryL2 = getFromRedis(redisCacheKey, localCacheKey);
+                if (retryL2 != null) return retryL2;
+                throw new IllegalStateException("동시 요청 과다로 일시적 조회 지연이 발생했습니다.");
+            }
+
+            try {
+                // Double-Checked Locking: 락을 대기하다가 획득한 스레드는 앞선 스레드가 채워둔 캐시를 즉시 재확인
+                PageResponse<HallOfFameEntry> doubleCheckL1 = localCache.getIfPresent(localCacheKey);
+                if (doubleCheckL1 != null) {
+                    log.info("[Double-Check L1 적중] 락 대기 후 L1 캐시 재활용 {}", localCacheKey);
+                    return doubleCheckL1;
+                }
+                PageResponse<HallOfFameEntry> doubleCheckL2 = getFromRedis(redisCacheKey, localCacheKey);
+                if (doubleCheckL2 != null) {
+                    log.info("[Double-Check L2 적중] 락 대기 후 L2 캐시 재활용 {}", localCacheKey);
+                    return doubleCheckL2;
+                }
+
+                // 4. 최초 락 획득 스레드만 단 1회 RDBMS(MySQL) 조회 수행
+                log.info("[단 1회 DB 조회 및 캐시 워밍 진행] {}", localCacheKey);
+                Pageable pageable = PageRequest.of(validatedPage, validatedSize);
+                Page<SeasonLeaderboardSnapshot> snapshotPage =
+                        snapshotRepository.findBySeasonIdOrderByFinalRankAsc(seasonId, pageable);
+
+                Page<HallOfFameEntry> entryPage = snapshotPage.map(snapshot ->
+                        new HallOfFameEntry(
+                                snapshot.getFinalRank(),
+                                snapshot.getUserId(),
+                                snapshot.getFinalScore(),
+                                snapshot.getArchivedAt()
+                        )
+                );
+
+                PageResponse<HallOfFameEntry> response = PageResponse.from(entryPage);
+
+                // L1 및 L2(TTL 1시간) 동시 적재
+                localCache.put(localCacheKey, response);
+                try {
+                    String json = objectMapper.writeValueAsString(response);
+                    redisTemplate.opsForValue().set(redisCacheKey, json, 1, TimeUnit.HOURS);
+                } catch (Exception e) {
+                    log.warn("[L2 캐시 적재 실패] error={}", e.getMessage());
+                }
+
+                return response;
+            } finally {
+                if (lock.isHeldByCurrentThread()) {
+                    lock.unlock();
+                }
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new RuntimeException("분산 락 대기 중 인터럽트 발생", e);
+        }
+    }
+
+    private PageResponse<HallOfFameEntry> getFromRedis(String redisCacheKey, String localCacheKey) {
         try {
             String l2CachedJson = redisTemplate.opsForValue().get(redisCacheKey);
             if (l2CachedJson != null) {
@@ -193,41 +270,13 @@ public class LeaderboardService {
                         l2CachedJson,
                         new TypeReference<PageResponse<HallOfFameEntry>>() {}
                 );
-                // L1 로컬 캐시 동기화 (워밍)
                 localCache.put(localCacheKey, l2Cached);
                 return l2Cached;
             }
         } catch (Exception e) {
-            log.warn("[L2 캐시 조회 실패 - DB 폴백 진행] error={}", e.getMessage());
+            log.warn("[L2 캐시 조회 실패 - DB 폴백] error={}", e.getMessage());
         }
-
-        // 3. 캐시 미스 -> RDBMS (MySQL) 인덱스 조회 (~10ms)
-        log.info("[캐시 미스 -> RDBMS 조회 및 캐시 워밍] {}", localCacheKey);
-        Pageable pageable = PageRequest.of(validatedPage, validatedSize);
-        Page<SeasonLeaderboardSnapshot> snapshotPage =
-                snapshotRepository.findBySeasonIdOrderByFinalRankAsc(seasonId, pageable);
-
-        Page<HallOfFameEntry> entryPage = snapshotPage.map(snapshot ->
-                new HallOfFameEntry(
-                        snapshot.getFinalRank(),
-                        snapshot.getUserId(),
-                        snapshot.getFinalScore(),
-                        snapshot.getArchivedAt()
-                )
-        );
-
-        PageResponse<HallOfFameEntry> response = PageResponse.from(entryPage);
-
-        // 4. L1(Caffeine) 및 L2(Redis, TTL 1시간) 동시 적재
-        localCache.put(localCacheKey, response);
-        try {
-            String json = objectMapper.writeValueAsString(response);
-            redisTemplate.opsForValue().set(redisCacheKey, json, 1, TimeUnit.HOURS);
-        } catch (Exception e) {
-            log.warn("[L2 캐시 적재 실패] error={}", e.getMessage());
-        }
-
-        return response;
+        return null;
     }
 
     public void clearLocalCache() {
