@@ -4,6 +4,7 @@ import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.github.benmanes.caffeine.cache.Cache;
 import com.github.benmanes.caffeine.cache.Caffeine;
+import com.nexon.platform.config.CachePubSubConfig;
 import com.nexon.platform.dto.HallOfFameEntry;
 import com.nexon.platform.dto.LeaderboardEntry;
 import com.nexon.platform.dto.PageResponse;
@@ -173,7 +174,6 @@ public class LeaderboardService {
         return new SeasonArchiveResponse(seasonId, snapshots.size(), topUserId, topScore);
     }
 
-    // [Day 28] Redisson 분산 락(Mutex) 기반 캐시 스탬피드 방어 및 Double-Checked Locking 적용
     @Transactional(readOnly = true)
     public PageResponse<HallOfFameEntry> getHallOfFame(int seasonId, int page, int size) {
         int validatedSize = Math.min(Math.max(size, 1), 100);
@@ -196,10 +196,9 @@ public class LeaderboardService {
             return l2Cached;
         }
 
-        // 3. 캐시 미스 -> Redisson 분산 락(Mutex) 획득 시도 (동시 요청 중 단 1개만 DB 접근 허용)
+        // 3. 캐시 미스 -> Redisson 분산 락(Mutex) 획득 시도
         RLock lock = redissonClient.getLock(lockKey);
         try {
-            // 최대 3초 대기, 5초 후 자동 해제
             boolean isLocked = lock.tryLock(3, 5, TimeUnit.SECONDS);
             if (!isLocked) {
                 log.warn("[락 획득 타임아웃] {}", lockKey);
@@ -211,7 +210,6 @@ public class LeaderboardService {
             }
 
             try {
-                // Double-Checked Locking: 락을 대기하다가 획득한 스레드는 앞선 스레드가 채워둔 캐시를 즉시 재확인
                 PageResponse<HallOfFameEntry> doubleCheckL1 = localCache.getIfPresent(localCacheKey);
                 if (doubleCheckL1 != null) {
                     log.info("[Double-Check L1 적중] 락 대기 후 L1 캐시 재활용 {}", localCacheKey);
@@ -223,7 +221,7 @@ public class LeaderboardService {
                     return doubleCheckL2;
                 }
 
-                // 4. 최초 락 획득 스레드만 단 1회 RDBMS(MySQL) 조회 수행
+                // 4. 단 1회 DB 조회 및 캐시 워밍
                 log.info("[단 1회 DB 조회 및 캐시 워밍 진행] {}", localCacheKey);
                 Pageable pageable = PageRequest.of(validatedPage, validatedSize);
                 Page<SeasonLeaderboardSnapshot> snapshotPage =
@@ -277,6 +275,38 @@ public class LeaderboardService {
             log.warn("[L2 캐시 조회 실패 - DB 폴백] error={}", e.getMessage());
         }
         return null;
+    }
+
+    // [Day 30 신규] 분산 캐시 무효화 트리거: L1 삭제 -> L2(Redis) 삭제 -> 전체 인스턴스 Pub/Sub 브로드캐스트
+    public void evictHallOfFameCache(int seasonId, int page, int size) {
+        String localCacheKey = String.format("hof:season:%d:page:%d:size:%d", seasonId, page, size);
+        String redisCacheKey = "cache:" + localCacheKey;
+
+        // 1. 현재 인스턴스의 L1 로컬 캐시 제거
+        localCache.invalidate(localCacheKey);
+
+        // 2. L2 분산 캐시 (Redis) 키 제거
+        redisTemplate.delete(redisCacheKey);
+
+        // 3. Redis Pub/Sub 채널로 다른 모든 서버 인스턴스에 L1 무효화 이벤트 브로드캐스트
+        redisTemplate.convertAndSend(CachePubSubConfig.CACHE_EVICT_TOPIC, localCacheKey);
+        log.info("[분산 캐시 무효화 완료 및 Pub/Sub 브로드캐스트] targetKey={}", localCacheKey);
+    }
+
+    // [Day 30 신규] Redis Pub/Sub 채널로부터 무효화 메시지 수신 시 실행되는 리스너 콜백
+    public void handleCacheEvictMessage(String message) {
+        log.info("[L1 로컬 캐시 분산 무효화 이벤트 수신] 대상 키={}", message);
+        if ("ALL".equalsIgnoreCase(message.trim())) {
+            localCache.invalidateAll();
+        } else {
+            localCache.invalidate(message.trim());
+        }
+    }
+
+    // 테스트 검증용 메서드들
+    public boolean isLocalCached(int seasonId, int page, int size) {
+        String localCacheKey = String.format("hof:season:%d:page:%d:size:%d", seasonId, page, size);
+        return localCache.getIfPresent(localCacheKey) != null;
     }
 
     public void clearLocalCache() {
