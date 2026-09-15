@@ -88,4 +88,14 @@ public class LeaderboardController {
         PageResponse<HallOfFameEntry> response = leaderboardService.getHallOfFame(seasonId, page, size);
         return CommonResponse.ok("시즌 " + seasonId + " 명예의 전당 " + (page + 1) + "페이지 조회 완료", response);
     }
+
+    @Operation(summary = "명예의 전당 캐시 수동 무효화 및 전체 서버 L1 동기화 (Redis Pub/Sub)")
+    @DeleteMapping("/season/{seasonId}/hall-of-fame/cache")
+    public CommonResponse<Void> evictHallOfFameCache(
+            @PathVariable int seasonId,
+            @RequestParam(defaultValue = "0") int page,
+            @RequestParam(defaultValue = "10") int size) {
+        leaderboardService.evictHallOfFameCache(seasonId, page, size);
+        return CommonResponse.ok("시즌 " + seasonId + " 명예의 전당 캐시가 클러스터 전체에서 무효화되었습니다.", null);
+    }
 }
