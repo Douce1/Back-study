@@ -1,5 +1,6 @@
 package com.nexon.platform.controller;
 
+import com.nexon.platform.annotation.Idempotent;
 import com.nexon.platform.annotation.RateLimit;
 import com.nexon.platform.dto.CommonResponse;
 import com.nexon.platform.dto.HallOfFameEntry;
@@ -29,16 +30,19 @@ public class LeaderboardController {
         this.leaderboardService = leaderboardService;
     }
 
-    @Operation(summary = "내 게임 점수 등록/갱신 (ZADD)")
+    @Operation(summary = "내 게임 점수 등록/갱신 (선착순 동점자 처리 및 멱등성 보장)")
+    @Idempotent(name = "submit-score", timeoutSeconds = 600)
     @PostMapping("/score")
     public CommonResponse<Void> submitScore(
-            @AuthenticationPrincipal Long userId,
+            @AuthenticationPrincipal Long authUserId,
+            @RequestParam(required = false) Long userId,
             @Valid @RequestBody ScoreSubmitRequest request) {
-        if (userId == null) {
-            throw new IllegalArgumentException("로그인이 필요한 서비스입니다.");
+        Long targetUserId = (authUserId != null) ? authUserId : userId;
+        if (targetUserId == null) {
+            throw new IllegalArgumentException("로그인 정보 또는 userId 파라미터가 필요합니다.");
         }
-        leaderboardService.submitScore(userId, request.score());
-        return CommonResponse.ok("점수가 성공적으로 반영되었습니다.", null);
+        leaderboardService.submitScore(targetUserId, request.score());
+        return CommonResponse.ok("유저 " + targetUserId + "의 점수(" + request.score() + "점)가 등록되었습니다.", null);
     }
 
     @Operation(summary = "실시간 상위 랭커 조회 (Top N)")
@@ -81,7 +85,7 @@ public class LeaderboardController {
     }
 
     @Operation(summary = "과거 시즌 명예의 전당 페이징 조회 (RDBMS 아카이브)")
-    @RateLimit(name = "hall-of-fame", limit = 10, periodSeconds = 1) // 1초당 최대 10회 허용
+    @RateLimit(name = "hall-of-fame", limit = 10, periodSeconds = 1)
     @GetMapping("/season/{seasonId}/hall-of-fame")
     public CommonResponse<PageResponse<HallOfFameEntry>> getHallOfFame(
             @PathVariable int seasonId,
@@ -90,7 +94,6 @@ public class LeaderboardController {
         PageResponse<HallOfFameEntry> response = leaderboardService.getHallOfFame(seasonId, page, size);
         return CommonResponse.ok("시즌 " + seasonId + " 명예의 전당 " + (page + 1) + "페이지 조회 완료", response);
     }
-
 
     @Operation(summary = "명예의 전당 캐시 수동 무효화 및 전체 서버 L1 동기화 (Redis Pub/Sub)")
     @DeleteMapping("/season/{seasonId}/hall-of-fame/cache")
