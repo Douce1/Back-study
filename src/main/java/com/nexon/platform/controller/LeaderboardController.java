@@ -1,5 +1,6 @@
 package com.nexon.platform.controller;
 
+import com.nexon.platform.annotation.RateLimit;
 import com.nexon.platform.dto.CommonResponse;
 import com.nexon.platform.dto.HallOfFameEntry;
 import com.nexon.platform.dto.LeaderboardEntry;
@@ -80,6 +81,7 @@ public class LeaderboardController {
     }
 
     @Operation(summary = "과거 시즌 명예의 전당 페이징 조회 (RDBMS 아카이브)")
+    @RateLimit(name = "hall-of-fame", limit = 10, periodSeconds = 1) // 1초당 최대 10회 허용
     @GetMapping("/season/{seasonId}/hall-of-fame")
     public CommonResponse<PageResponse<HallOfFameEntry>> getHallOfFame(
             @PathVariable int seasonId,
@@ -88,6 +90,7 @@ public class LeaderboardController {
         PageResponse<HallOfFameEntry> response = leaderboardService.getHallOfFame(seasonId, page, size);
         return CommonResponse.ok("시즌 " + seasonId + " 명예의 전당 " + (page + 1) + "페이지 조회 완료", response);
     }
+
 
     @Operation(summary = "명예의 전당 캐시 수동 무효화 및 전체 서버 L1 동기화 (Redis Pub/Sub)")
     @DeleteMapping("/season/{seasonId}/hall-of-fame/cache")
