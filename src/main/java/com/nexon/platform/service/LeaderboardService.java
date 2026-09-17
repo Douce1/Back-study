@@ -5,8 +5,10 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.github.benmanes.caffeine.cache.Cache;
 import com.github.benmanes.caffeine.cache.Caffeine;
 import com.nexon.platform.config.CachePubSubConfig;
+import com.nexon.platform.consumer.LeaderboardEventConsumer;
 import com.nexon.platform.dto.HallOfFameEntry;
 import com.nexon.platform.dto.LeaderboardEntry;
+import com.nexon.platform.dto.LeaderboardRankChangeEvent;
 import com.nexon.platform.dto.PageResponse;
 import com.nexon.platform.dto.SeasonArchiveResponse;
 import com.nexon.platform.dto.UserRankResponse;
@@ -24,6 +26,7 @@ import org.springframework.data.redis.connection.RedisConnection;
 import org.springframework.data.redis.core.RedisCallback;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.data.redis.core.ZSetOperations;
+import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -47,6 +50,7 @@ public class LeaderboardService {
     private final SeasonLeaderboardSnapshotRepository snapshotRepository;
     private final ObjectMapper objectMapper;
     private final RedissonClient redissonClient;
+    private final KafkaTemplate<String, String> kafkaTemplate;
 
     // L1 로컬 캐시 (Caffeine: 최대 500개 페이지, 10분 만료)
     private final Cache<String, PageResponse<HallOfFameEntry>> localCache;
@@ -54,11 +58,13 @@ public class LeaderboardService {
     public LeaderboardService(StringRedisTemplate redisTemplate,
                               SeasonLeaderboardSnapshotRepository snapshotRepository,
                               ObjectMapper objectMapper,
-                              RedissonClient redissonClient) {
+                              RedissonClient redissonClient,
+                              KafkaTemplate<String, String> kafkaTemplate) {
         this.redisTemplate = redisTemplate;
         this.snapshotRepository = snapshotRepository;
         this.objectMapper = objectMapper;
         this.redissonClient = redissonClient;
+        this.kafkaTemplate = kafkaTemplate;
         this.localCache = Caffeine.newBuilder()
                 .maximumSize(500)
                 .expireAfterWrite(10, TimeUnit.MINUTES)
@@ -79,6 +85,23 @@ public class LeaderboardService {
         double compositeScore = calculateCompositeScore(score);
         redisTemplate.opsForZSet().add(DEFAULT_LEADERBOARD_KEY, String.valueOf(userId), compositeScore);
         log.info("[리더보드 점수 갱신] 유저 {}: 원본점수={}점 (복합점수={})", userId, score, compositeScore);
+
+        // [Day 33] 상위 랭커(Top 10) 진입 실시간 판별 및 Kafka 비동기 이벤트 스트리밍
+        try {
+            Long currentRankIndex = redisTemplate.opsForZSet().reverseRank(DEFAULT_LEADERBOARD_KEY, String.valueOf(userId));
+            if (currentRankIndex != null && currentRankIndex < 10) { // 0~9위 (Top 10)
+                int displayRank = currentRankIndex.intValue() + 1;
+                LeaderboardRankChangeEvent event = LeaderboardRankChangeEvent.topRankEntry(userId, displayRank, score);
+                String eventPayload = objectMapper.writeValueAsString(event);
+
+                kafkaTemplate.send(LeaderboardEventConsumer.LEADERBOARD_RANK_TOPIC, String.valueOf(userId), eventPayload);
+                log.info("[Kafka 랭킹 변동 이벤트 발행 완료] topic={}, 유저={}, 등수={}위",
+                        LeaderboardEventConsumer.LEADERBOARD_RANK_TOPIC, userId, displayRank);
+            }
+        } catch (Exception e) {
+            // 이벤트 발행 장애가 발생하더라도 메인 트랜잭션(점수 등록)을 롤백시키지 않고 격리
+            log.error("[Kafka 랭킹 이벤트 발행 실패 - 격리 처리] userId={}, error={}", userId, e.getMessage());
+        }
     }
 
     public List<LeaderboardEntry> getTopRankers(int limit) {
@@ -277,23 +300,18 @@ public class LeaderboardService {
         return null;
     }
 
-    // [Day 30 신규] 분산 캐시 무효화 트리거: L1 삭제 -> L2(Redis) 삭제 -> 전체 인스턴스 Pub/Sub 브로드캐스트
+    // 분산 캐시 무효화 트리거: L1 삭제 -> L2(Redis) 삭제 -> 전체 인스턴스 Pub/Sub 브로드캐스트
     public void evictHallOfFameCache(int seasonId, int page, int size) {
         String localCacheKey = String.format("hof:season:%d:page:%d:size:%d", seasonId, page, size);
         String redisCacheKey = "cache:" + localCacheKey;
 
-        // 1. 현재 인스턴스의 L1 로컬 캐시 제거
         localCache.invalidate(localCacheKey);
-
-        // 2. L2 분산 캐시 (Redis) 키 제거
         redisTemplate.delete(redisCacheKey);
-
-        // 3. Redis Pub/Sub 채널로 다른 모든 서버 인스턴스에 L1 무효화 이벤트 브로드캐스트
         redisTemplate.convertAndSend(CachePubSubConfig.CACHE_EVICT_TOPIC, localCacheKey);
         log.info("[분산 캐시 무효화 완료 및 Pub/Sub 브로드캐스트] targetKey={}", localCacheKey);
     }
 
-    // [Day 30 신규] Redis Pub/Sub 채널로부터 무효화 메시지 수신 시 실행되는 리스너 콜백
+    // Redis Pub/Sub 채널로부터 무효화 메시지 수신 시 실행되는 리스너 콜백
     public void handleCacheEvictMessage(String message) {
         log.info("[L1 로컬 캐시 분산 무효화 이벤트 수신] 대상 키={}", message);
         if ("ALL".equalsIgnoreCase(message.trim())) {
@@ -303,7 +321,6 @@ public class LeaderboardService {
         }
     }
 
-    // 테스트 검증용 메서드들
     public boolean isLocalCached(int seasonId, int page, int size) {
         String localCacheKey = String.format("hof:season:%d:page:%d:size:%d", seasonId, page, size);
         return localCache.getIfPresent(localCacheKey) != null;
