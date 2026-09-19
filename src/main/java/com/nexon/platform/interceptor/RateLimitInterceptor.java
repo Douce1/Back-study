@@ -1,6 +1,7 @@
 package com.nexon.platform.interceptor;
 
 import com.nexon.platform.annotation.RateLimit;
+import com.nexon.platform.metrics.LeaderboardMetrics;
 import com.nexon.platform.service.RateLimiterService;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
@@ -13,9 +14,12 @@ import org.springframework.web.servlet.HandlerInterceptor;
 public class RateLimitInterceptor implements HandlerInterceptor {
 
     private final RateLimiterService rateLimiterService;
+    private final LeaderboardMetrics leaderboardMetrics;
 
-    public RateLimitInterceptor(RateLimiterService rateLimiterService) {
+    public RateLimitInterceptor(RateLimiterService rateLimiterService,
+                                LeaderboardMetrics leaderboardMetrics) {
         this.rateLimiterService = rateLimiterService;
+        this.leaderboardMetrics = leaderboardMetrics;
     }
 
     @Override
@@ -40,7 +44,7 @@ public class RateLimitInterceptor implements HandlerInterceptor {
         );
 
         if (!allowed) {
-            // GlobalExceptionHandler에 걸려 500으로 왜곡되지 않도록 HTTP 429를 직접 응답
+            leaderboardMetrics.incrementRateLimitBlocked(actionName);
             response.setStatus(HttpStatus.TOO_MANY_REQUESTS.value());
             response.setContentType("application/json;charset=UTF-8");
             response.getWriter().write("{\"success\":false,\"message\":\"단시간에 너무 많은 요청이 발생했습니다. 잠시 후 다시 시도해 주세요.\"}");

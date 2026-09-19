@@ -1,6 +1,7 @@
 package com.nexon.platform.interceptor;
 
 import com.nexon.platform.annotation.Idempotent;
+import com.nexon.platform.metrics.LeaderboardMetrics;
 import com.nexon.platform.service.IdempotencyService;
 import com.nexon.platform.service.IdempotencyService.AcquireResult;
 import jakarta.servlet.http.HttpServletRequest;
@@ -19,9 +20,12 @@ public class IdempotencyInterceptor implements HandlerInterceptor {
     public static final String ATTR_TIMEOUT = "IDEMPOTENT_TIMEOUT";
 
     private final IdempotencyService idempotencyService;
+    private final LeaderboardMetrics leaderboardMetrics;
 
-    public IdempotencyInterceptor(IdempotencyService idempotencyService) {
+    public IdempotencyInterceptor(IdempotencyService idempotencyService,
+                                  LeaderboardMetrics leaderboardMetrics) {
         this.idempotencyService = idempotencyService;
+        this.leaderboardMetrics = leaderboardMetrics;
     }
 
     @Override
@@ -54,14 +58,13 @@ public class IdempotencyInterceptor implements HandlerInterceptor {
         }
 
         if (result == AcquireResult.COMPLETED) {
-            // 이미 성공한 요청이므로 컨트롤러 로직을 스킵하고 200 OK 반환
+            leaderboardMetrics.incrementIdempotencyBypassed(actionName);
             response.setStatus(HttpStatus.OK.value());
             response.setContentType("application/json;charset=UTF-8");
             response.getWriter().write("{\"success\":true,\"message\":\"이미 처리 완료된 요청입니다 (멱등성 보장).\"}");
             return false;
         }
 
-        // 신규 선점 성공 -> afterCompletion에서 후처리할 수 있도록 request attribute에 보관
         request.setAttribute(ATTR_ACTION_NAME, actionName);
         request.setAttribute(ATTR_IDEMPOTENCY_KEY, idempotencyKey.trim());
         request.setAttribute(ATTR_TIMEOUT, idempotent.timeoutSeconds());
@@ -78,7 +81,6 @@ public class IdempotencyInterceptor implements HandlerInterceptor {
             return;
         }
 
-        // 요청이 정상 처리(HTTP 2xx)되었으면 COMPLETED 갱신, 에러 발생 시 재시도를 위해 롤백(삭제)
         if (ex == null && response.getStatus() >= 200 && response.getStatus() < 300) {
             idempotencyService.markCompleted(actionName, idempotencyKey, timeout != null ? timeout : 600L);
         } else {

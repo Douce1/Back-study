@@ -13,6 +13,7 @@ import com.nexon.platform.dto.PageResponse;
 import com.nexon.platform.dto.SeasonArchiveResponse;
 import com.nexon.platform.dto.UserRankResponse;
 import com.nexon.platform.entity.SeasonLeaderboardSnapshot;
+import com.nexon.platform.metrics.LeaderboardMetrics;
 import com.nexon.platform.repository.SeasonLeaderboardSnapshotRepository;
 import org.redisson.api.RLock;
 import org.redisson.api.RedissonClient;
@@ -51,6 +52,7 @@ public class LeaderboardService {
     private final ObjectMapper objectMapper;
     private final RedissonClient redissonClient;
     private final KafkaTemplate<String, String> kafkaTemplate;
+    private final LeaderboardMetrics leaderboardMetrics;
 
     // L1 로컬 캐시 (Caffeine: 최대 500개 페이지, 10분 만료)
     private final Cache<String, PageResponse<HallOfFameEntry>> localCache;
@@ -59,12 +61,14 @@ public class LeaderboardService {
                               SeasonLeaderboardSnapshotRepository snapshotRepository,
                               ObjectMapper objectMapper,
                               RedissonClient redissonClient,
-                              KafkaTemplate<String, String> kafkaTemplate) {
+                              KafkaTemplate<String, String> kafkaTemplate,
+                              LeaderboardMetrics leaderboardMetrics) {
         this.redisTemplate = redisTemplate;
         this.snapshotRepository = snapshotRepository;
         this.objectMapper = objectMapper;
         this.redissonClient = redissonClient;
         this.kafkaTemplate = kafkaTemplate;
+        this.leaderboardMetrics = leaderboardMetrics;
         this.localCache = Caffeine.newBuilder()
                 .maximumSize(500)
                 .expireAfterWrite(10, TimeUnit.MINUTES)
@@ -82,11 +86,14 @@ public class LeaderboardService {
     }
 
     public void submitScore(Long userId, Double score) {
-        double compositeScore = calculateCompositeScore(score);
-        redisTemplate.opsForZSet().add(DEFAULT_LEADERBOARD_KEY, String.valueOf(userId), compositeScore);
-        log.info("[리더보드 점수 갱신] 유저 {}: 원본점수={}점 (복합점수={})", userId, score, compositeScore);
+        // 타이머 계측 및 점수 등록 카운트 증가
+        leaderboardMetrics.recordScoreSubmit(() -> {
+            double compositeScore = calculateCompositeScore(score);
+            redisTemplate.opsForZSet().add(DEFAULT_LEADERBOARD_KEY, String.valueOf(userId), compositeScore);
+            log.info("[리더보드 점수 갱신] 유저 {}: 원본점수={}점 (복합점수={})", userId, score, compositeScore);
+        });
 
-        // [Day 33] 상위 랭커(Top 10) 진입 실시간 판별 및 Kafka 비동기 이벤트 스트리밍
+        // Top 10 진입 실시간 판별 및 Kafka 비동기 이벤트 스트리밍
         try {
             Long currentRankIndex = redisTemplate.opsForZSet().reverseRank(DEFAULT_LEADERBOARD_KEY, String.valueOf(userId));
             if (currentRankIndex != null && currentRankIndex < 10) { // 0~9위 (Top 10)
@@ -95,11 +102,11 @@ public class LeaderboardService {
                 String eventPayload = objectMapper.writeValueAsString(event);
 
                 kafkaTemplate.send(LeaderboardEventConsumer.LEADERBOARD_RANK_TOPIC, String.valueOf(userId), eventPayload);
+                leaderboardMetrics.incrementTopRankEvent();
                 log.info("[Kafka 랭킹 변동 이벤트 발행 완료] topic={}, 유저={}, 등수={}위",
                         LeaderboardEventConsumer.LEADERBOARD_RANK_TOPIC, userId, displayRank);
             }
         } catch (Exception e) {
-            // 이벤트 발행 장애가 발생하더라도 메인 트랜잭션(점수 등록)을 롤백시키지 않고 격리
             log.error("[Kafka 랭킹 이벤트 발행 실패 - 격리 처리] userId={}, error={}", userId, e.getMessage());
         }
     }
